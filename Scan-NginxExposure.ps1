@@ -7,9 +7,14 @@
     .\Scan-NginxExposure.ps1 -UrlListPath @{Path=".\bnl.txt";Region="BNL"}, @{Path=".\nordics.txt";Region="Nordics"}
 #>
 
+[CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Scan')]
     [hashtable[]] $UrlListPath,
+
+    # Self-test of the HTTP/2 (ALPN) probe against one host, e.g. -TestAlpnHost nginx.org
+    [Parameter(Mandatory = $true, ParameterSetName = 'Probe')]
+    [string] $TestAlpnHost,
 
     [string] $OutputCsv = ".\nginx_scan_results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
 
@@ -59,11 +64,269 @@ function Test-H2Alpn {
     finally { $client.Close() }
 }
 
+# ---- Windows PowerShell 5.1 fallback: tiny Schannel (native Windows TLS) client, compiled with Add-Type ----
+$schannelSource = @'
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+
+// Minimal Schannel TLS client handshake that only reports which ALPN protocol the server selects.
+// Works on stock Windows (Windows PowerShell 5.1 / .NET Framework). Certificates are NOT validated.
+public static class SchannelAlpn
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct SecBuffer { public uint cbBuffer; public uint BufferType; public IntPtr pvBuffer; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SecBufferDesc { public uint ulVersion; public uint cBuffers; public IntPtr pBuffers; }
+
+    [DllImport("secur32.dll", CharSet = CharSet.Unicode, EntryPoint = "AcquireCredentialsHandleW")]
+    static extern int AcquireCredentialsHandle(string pszPrincipal, string pszPackage, uint fCredentialUse,
+        IntPtr pvLogonId, IntPtr pAuthData, IntPtr pGetKeyFn, IntPtr pvGetKeyArgument, IntPtr phCredential, out long ptsExpiry);
+
+    [DllImport("secur32.dll", CharSet = CharSet.Unicode, EntryPoint = "InitializeSecurityContextW")]
+    static extern int InitializeSecurityContext(IntPtr phCredential, IntPtr phContext, string pszTargetName,
+        uint fContextReq, uint Reserved1, uint TargetDataRep, IntPtr pInput, uint Reserved2,
+        IntPtr phNewContext, IntPtr pOutput, out uint pfContextAttr, out long ptsExpiry);
+
+    [DllImport("secur32.dll", EntryPoint = "QueryContextAttributesW")]
+    static extern int QueryContextAttributes(IntPtr phContext, uint ulAttribute, IntPtr pBuffer);
+
+    [DllImport("secur32.dll")] static extern int DeleteSecurityContext(IntPtr phContext);
+    [DllImport("secur32.dll")] static extern int FreeCredentialsHandle(IntPtr phCredential);
+    [DllImport("secur32.dll")] static extern int FreeContextBuffer(IntPtr pvContextBuffer);
+
+    const uint SECBUFFER_EMPTY = 0, SECBUFFER_TOKEN = 2, SECBUFFER_EXTRA = 5, SECBUFFER_APPLICATION_PROTOCOLS = 18;
+    const uint ISC_FLAGS = 0x4 | 0x8 | 0x10 | 0x100 | 0x4000 | 0x8000 | 0x80000;
+    // REPLAY_DETECT | SEQUENCE_DETECT | CONFIDENTIALITY | ALLOCATE_MEMORY | EXTENDED_ERROR | STREAM | MANUAL_CRED_VALIDATION
+    const int SEC_E_OK = 0;
+    const int SEC_I_CONTINUE_NEEDED = 0x00090312;
+    const int SEC_E_INCOMPLETE_MESSAGE = unchecked((int)0x80090318);
+    const uint SECPKG_ATTR_APPLICATION_PROTOCOL = 35;
+
+    static IntPtr BuildDesc(SecBuffer[] bufs)
+    {
+        int sz = Marshal.SizeOf(typeof(SecBuffer));
+        IntPtr arr = Marshal.AllocHGlobal(sz * bufs.Length);
+        for (int i = 0; i < bufs.Length; i++)
+            Marshal.StructureToPtr(bufs[i], new IntPtr(arr.ToInt64() + (long)i * sz), false);
+        SecBufferDesc d = new SecBufferDesc();
+        d.ulVersion = 0; d.cBuffers = (uint)bufs.Length; d.pBuffers = arr;
+        IntPtr pd = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecBufferDesc)));
+        Marshal.StructureToPtr(d, pd, false);
+        return pd;
+    }
+
+    static SecBuffer ReadBuf(IntPtr desc, int index)
+    {
+        SecBufferDesc d = (SecBufferDesc)Marshal.PtrToStructure(desc, typeof(SecBufferDesc));
+        int sz = Marshal.SizeOf(typeof(SecBuffer));
+        return (SecBuffer)Marshal.PtrToStructure(new IntPtr(d.pBuffers.ToInt64() + (long)index * sz), typeof(SecBuffer));
+    }
+
+    static void FreeDesc(IntPtr desc)
+    {
+        SecBufferDesc d = (SecBufferDesc)Marshal.PtrToStructure(desc, typeof(SecBufferDesc));
+        Marshal.FreeHGlobal(d.pBuffers);
+        Marshal.FreeHGlobal(desc);
+    }
+
+    static byte[] BuildAlpnBlob()
+    {
+        byte[] list = new byte[] { 2, (byte)'h', (byte)'2', 8, (byte)'h', (byte)'t', (byte)'t', (byte)'p', (byte)'/', (byte)'1', (byte)'.', (byte)'1' };
+        List<byte> b = new List<byte>();
+        b.AddRange(BitConverter.GetBytes((uint)(4 + 2 + list.Length))); // ProtocolListsSize
+        b.AddRange(BitConverter.GetBytes((uint)2));                      // SecApplicationProtocolNegotiationExt_ALPN
+        b.AddRange(BitConverter.GetBytes((ushort)list.Length));          // ProtocolListSize
+        b.AddRange(list);
+        return b.ToArray();
+    }
+
+    static int ReadMore(NetworkStream ns, List<byte> pending)
+    {
+        byte[] buf = new byte[16384];
+        int n = ns.Read(buf, 0, buf.Length);
+        if (n <= 0) throw new Exception("connection closed during TLS handshake");
+        for (int i = 0; i < n; i++) pending.Add(buf[i]);
+        return n;
+    }
+
+    // Returns the negotiated ALPN protocol ("h2", "http/1.1"), "" when the server selected none,
+    // or "ERROR: <reason>" when the handshake failed.
+    public static string Probe(string host, int port, int timeoutMs)
+    {
+        TcpClient client = new TcpClient();
+        IntPtr cred = IntPtr.Zero, ctx = IntPtr.Zero;
+        bool haveCred = false, haveCtx = false;
+        try
+        {
+            IAsyncResult iar = client.BeginConnect(host, port, null, null);
+            if (!iar.AsyncWaitHandle.WaitOne(timeoutMs)) return "ERROR: connect timeout";
+            client.EndConnect(iar);
+            client.ReceiveTimeout = timeoutMs; client.SendTimeout = timeoutMs;
+            NetworkStream ns = client.GetStream();
+
+            cred = Marshal.AllocHGlobal(IntPtr.Size * 2);
+            ctx = Marshal.AllocHGlobal(IntPtr.Size * 2);
+            for (int z = 0; z < IntPtr.Size * 2; z++) { Marshal.WriteByte(cred, z, 0); Marshal.WriteByte(ctx, z, 0); }
+            long exp;
+            int rc = AcquireCredentialsHandle(null, "Microsoft Unified Security Protocol Provider", 2,
+                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, cred, out exp);
+            if (rc != 0) return "ERROR: AcquireCredentialsHandle 0x" + rc.ToString("X8");
+            haveCred = true;
+
+            List<byte> pending = new List<byte>();
+            bool first = true;
+            for (int round = 0; round < 20; round++)
+            {
+                SecBuffer[] inb;
+                IntPtr tokMem = IntPtr.Zero, alpnMem = IntPtr.Zero;
+                IntPtr inDesc = IntPtr.Zero;
+                if (first)
+                {
+                    byte[] blob = BuildAlpnBlob();
+                    alpnMem = Marshal.AllocHGlobal(blob.Length);
+                    Marshal.Copy(blob, 0, alpnMem, blob.Length);
+                    SecBuffer a = new SecBuffer();
+                    a.cbBuffer = (uint)blob.Length; a.BufferType = SECBUFFER_APPLICATION_PROTOCOLS; a.pvBuffer = alpnMem;
+                    inb = new SecBuffer[] { a };
+                }
+                else
+                {
+                    byte[] data = pending.ToArray();
+                    tokMem = Marshal.AllocHGlobal(data.Length);
+                    Marshal.Copy(data, 0, tokMem, data.Length);
+                    SecBuffer t = new SecBuffer();
+                    t.cbBuffer = (uint)data.Length; t.BufferType = SECBUFFER_TOKEN; t.pvBuffer = tokMem;
+                    SecBuffer e = new SecBuffer();
+                    e.cbBuffer = 0; e.BufferType = SECBUFFER_EMPTY; e.pvBuffer = IntPtr.Zero;
+                    inb = new SecBuffer[] { t, e };
+                }
+                inDesc = BuildDesc(inb);
+                SecBuffer o = new SecBuffer();
+                o.cbBuffer = 0; o.BufferType = SECBUFFER_TOKEN; o.pvBuffer = IntPtr.Zero;
+                IntPtr outDesc = BuildDesc(new SecBuffer[] { o });
+
+                uint attrs; long exp2;
+                rc = InitializeSecurityContext(cred, first ? IntPtr.Zero : ctx, host, ISC_FLAGS, 0, 0,
+                    inDesc, 0, ctx, outDesc, out attrs, out exp2);
+                if (first && (rc == SEC_E_OK || rc == SEC_I_CONTINUE_NEEDED)) haveCtx = true;
+
+                uint extra = 0;
+                if (!first)
+                {
+                    SecBuffer e1 = ReadBuf(inDesc, 1);
+                    if (e1.BufferType == SECBUFFER_EXTRA) extra = e1.cbBuffer;
+                }
+                SecBuffer ob = ReadBuf(outDesc, 0);
+                byte[] outTok = null;
+                if (ob.pvBuffer != IntPtr.Zero)
+                {
+                    if (ob.cbBuffer > 0)
+                    {
+                        outTok = new byte[ob.cbBuffer];
+                        Marshal.Copy(ob.pvBuffer, outTok, 0, (int)ob.cbBuffer);
+                    }
+                    FreeContextBuffer(ob.pvBuffer);
+                }
+                FreeDesc(inDesc); FreeDesc(outDesc);
+                if (alpnMem != IntPtr.Zero) Marshal.FreeHGlobal(alpnMem);
+                if (tokMem != IntPtr.Zero) Marshal.FreeHGlobal(tokMem);
+
+                if (outTok != null) ns.Write(outTok, 0, outTok.Length);
+
+                if (rc == SEC_E_OK) break;
+                if (rc == SEC_I_CONTINUE_NEEDED)
+                {
+                    if (!first && extra > 0 && extra <= pending.Count)
+                        pending.RemoveRange(0, pending.Count - (int)extra);
+                    else
+                        pending.Clear();
+                    if (pending.Count == 0) ReadMore(ns, pending);
+                }
+                else if (rc == SEC_E_INCOMPLETE_MESSAGE)
+                {
+                    ReadMore(ns, pending);
+                }
+                else
+                {
+                    return "ERROR: InitializeSecurityContext 0x" + rc.ToString("X8");
+                }
+                first = false;
+                if (round == 19) return "ERROR: handshake did not complete";
+            }
+
+            IntPtr q = Marshal.AllocHGlobal(512);
+            try
+            {
+                for (int i = 0; i < 512; i++) Marshal.WriteByte(q, i, 0);
+                rc = QueryContextAttributes(ctx, SECPKG_ATTR_APPLICATION_PROTOCOL, q);
+                if (rc != 0) return "ERROR: QueryContextAttributes 0x" + rc.ToString("X8");
+                int status = Marshal.ReadInt32(q, 0);
+                int len = Marshal.ReadByte(q, 8);
+                if (status != 1 || len == 0) return "";
+                byte[] id = new byte[len];
+                Marshal.Copy(new IntPtr(q.ToInt64() + 9), id, 0, len);
+                return Encoding.ASCII.GetString(id);
+            }
+            finally { Marshal.FreeHGlobal(q); }
+        }
+        catch (Exception ex)
+        {
+            return "ERROR: " + ex.Message;
+        }
+        finally
+        {
+            if (haveCtx) DeleteSecurityContext(ctx);
+            if (haveCred) FreeCredentialsHandle(cred);
+            if (ctx != IntPtr.Zero) Marshal.FreeHGlobal(ctx);
+            if (cred != IntPtr.Zero) Marshal.FreeHGlobal(cred);
+            client.Close();
+        }
+    }
+}
+'@
+
+function Test-H2Schannel {
+    param([string]$HostName, [int]$Port = 443, [int]$TimeoutSeconds = 10)
+    $r = [SchannelAlpn]::Probe($HostName, $Port, $TimeoutSeconds * 1000)
+    $script:H2Detail = $null
+    if ($r -like 'ERROR:*') { $script:H2Detail = $r; return $null }
+    return ($r -eq 'h2')
+}
+
+$schannelAvailable = $false
+$script:H2Detail = $null
+if ((-not $curlHasHttp2 -and -not $alpnAvailable) -or $PSCmdlet.ParameterSetName -eq 'Probe') {
+    try {
+        Add-Type -TypeDefinition $schannelSource -ErrorAction Stop
+        $schannelAvailable = $true
+    }
+    catch {
+        $schannelError = $_.Exception.Message
+    }
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Probe') {
+    Write-Host "curl.exe supports HTTP/2 : $curlHasHttp2"
+    Write-Host "SslStream ALPN (PS7)     : $alpnAvailable"
+    Write-Host "Schannel probe compiled  : $schannelAvailable $schannelError"
+    if ($schannelAvailable) {
+        $r = [SchannelAlpn]::Probe($TestAlpnHost, 443, $TimeoutSeconds * 1000)
+        Write-Host "Schannel ALPN result for $TestAlpnHost : '$r'   (h2 = HTTP/2, http/1.1 = no HTTP/2, empty = no ALPN, ERROR: = probe failed)"
+    }
+    return
+}
+
 if (-not $curlHasHttp2) {
     if ($alpnAvailable) {
-        Write-Warning "This curl.exe has no HTTP/2 support - HTTP/2 will be tested with a TLS ALPN probe instead."
+        Write-Warning "This curl.exe has no HTTP/2 support - HTTP/2 will be tested with a TLS ALPN probe (SslStream) instead."
+    } elseif ($schannelAvailable) {
+        Write-Warning "This curl.exe has no HTTP/2 support - HTTP/2 will be tested with a built-in Schannel ALPN probe instead."
     } else {
-        Write-Warning "This curl.exe has no HTTP/2 support and this PowerShell (5.1) has no ALPN API: Http2Supported will be 'Unknown'. Use PowerShell 7 (pwsh) or a curl.exe with HTTP2 (https://curl.se/windows/) for HTTP/2 results."
+        Write-Warning "This curl.exe has no HTTP/2 support and the Schannel probe could not be compiled ($schannelError): Http2Supported will be 'Unknown'."
     }
 }
 
@@ -216,10 +479,12 @@ $results = foreach ($target in $targets) {
     }
     else {
         $result.Http2Supported = 'Unknown'
-        if ($alpnAvailable -and $scan.EffectiveUrl -match '^https://(?<h>[^/:]+)(?::(?<p>\d+))?') {
+        $h2Detail = $null
+        if (($alpnAvailable -or $schannelAvailable) -and $scan.EffectiveUrl -match '^https://(?<h>[^/:]+)(?::(?<p>\d+))?') {
             $port = if ($Matches['p']) { [int]$Matches['p'] } else { 443 }
-            $alpn = Test-H2Alpn -HostName $Matches['h'] -Port $port -TimeoutSeconds $TimeoutSeconds
-            if ($null -ne $alpn) { $result.Http2Supported = $alpn }
+            $alpn = if ($alpnAvailable) { Test-H2Alpn -HostName $Matches['h'] -Port $port -TimeoutSeconds $TimeoutSeconds }
+                    else                { Test-H2Schannel -HostName $Matches['h'] -Port $port -TimeoutSeconds $TimeoutSeconds }
+            if ($null -ne $alpn) { $result.Http2Supported = $alpn } else { $h2Detail = $script:H2Detail }
         }
     }
 
@@ -227,7 +492,7 @@ $results = foreach ($target in $targets) {
     $result.DirectOriginExposure = ($result.VulnerableCandidate -and -not $result.FrontedByCdnWaf)
 
     if ($result.NginxDetected -and $result.Http2Supported -eq 'Unknown') {
-        $result.Caveat = (@($result.Caveat, "nginx detected but HTTP/2 could not be tested - check manually.") | Where-Object { $_ }) -join ' '
+        $result.Caveat = (@($result.Caveat, "nginx detected but HTTP/2 could not be tested - check manually. $h2Detail".Trim()) | Where-Object { $_ }) -join ' '
     }
     $tlsNote = $result.Caveat
     if ($result.VulnerableCandidate) {
