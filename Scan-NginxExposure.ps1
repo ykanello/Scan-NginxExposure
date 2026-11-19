@@ -17,7 +17,10 @@ param(
 
     # Never fall back to an unverified TLS connection (default: fall back, because this
     # tool only fingerprints headers and corporate TLS inspection breaks verification).
-    [switch] $StrictTls
+    [switch] $StrictTls,
+
+    # Skip certificate validation from the start (curl -k) instead of only after a TLS failure.
+    [switch] $SkipCertCheck
 )
 
 # ---- Sanity check: curl.exe must be available ----
@@ -119,11 +122,16 @@ $results = foreach ($target in $targets) {
         Error                = $null
     }
 
-    $scan = Invoke-CurlScan -Url $target.Url -TimeoutSeconds $TimeoutSeconds -UserAgent $userAgent
+    if ($SkipCertCheck) {
+        $scan = Invoke-CurlScan -Url $target.Url -TimeoutSeconds $TimeoutSeconds -UserAgent $userAgent -Insecure
+        $result.TlsVerified = $false
+    } else {
+        $scan = Invoke-CurlScan -Url $target.Url -TimeoutSeconds $TimeoutSeconds -UserAgent $userAgent
+    }
 
     # TLS trust failure (TLS inspection proxy, missing CA, ...): retry once without verification.
     # Safe here because the scan only reads the Server header / negotiated HTTP version.
-    if (-not $StrictTls -and $scan.ExitCode -in $script:TlsExitCodes) {
+    if (-not $StrictTls -and -not $SkipCertCheck -and $scan.ExitCode -in $script:TlsExitCodes) {
         $firstError = $scan.CurlError
         $scan = Invoke-CurlScan -Url $target.Url -TimeoutSeconds $TimeoutSeconds -UserAgent $userAgent -Insecure
         $result.TlsVerified = $false
