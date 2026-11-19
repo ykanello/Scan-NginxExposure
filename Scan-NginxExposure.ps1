@@ -13,7 +13,11 @@ param(
 
     [string] $OutputCsv = ".\nginx_scan_results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
 
-    [int] $TimeoutSeconds = 10
+    [int] $TimeoutSeconds = 10,
+
+    # Never fall back to an unverified TLS connection (default: fall back, because this
+    # tool only fingerprints headers and corporate TLS inspection breaks verification).
+    [switch] $StrictTls
 )
 
 # ---- Sanity check: curl.exe must be available ----
@@ -45,24 +49,35 @@ if (-not $targets) {
 
 Write-Host "Loaded $($targets.Count) URLs. Scanning with curl.exe..." -ForegroundColor Cyan
 
+# curl exit codes that mean "TLS handshake / certificate trust problem" (not a dead host)
+$script:TlsExitCodes = @(35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91)
+
 function Invoke-CurlScan {
-    param([string]$Url, [int]$TimeoutSeconds, [string]$UserAgent)
+    param([string]$Url, [int]$TimeoutSeconds, [string]$UserAgent, [switch]$Insecure)
 
     $headerFile = [System.IO.Path]::GetTempFileName()
     try {
         $wFormat = "{0}|{1}" -f '%{http_code}', '%{http_version}'
         $curlArgs = @(
-            '-s', '-L', '--max-redirs', '5',
+            '-s', '-S', '-L', '--max-redirs', '5',
             '-o', 'NUL',
             '-D', $headerFile,
             '--http2',
+            # schannel: do not fail when CRL/OCSP servers are unreachable (proxy/firewall)
+            '--ssl-no-revoke',
             '-A', $UserAgent,
             '--max-time', $TimeoutSeconds,
-            '-w', $wFormat,
-            $Url
+            '-w', $wFormat
         )
-        $stdout = & curl.exe @curlArgs 2>$null
+        if ($Insecure) { $curlArgs += '-k' }
+        $curlArgs += $Url
+
+        # -S keeps -s quiet but still prints the error text; capture it instead of discarding it
+        $out = & curl.exe @curlArgs 2>&1
         $exitCode = $LASTEXITCODE
+        $stdout = ($out | Where-Object { $_ -is [string] -and $_ -match '^\d{3}\|[\d\.]+$' } | Select-Object -Last 1)
+        $curlError = (($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
+                        ForEach-Object { $_.ToString().Trim() }) -join ' ')
         $rawHeaders = if (Test-Path $headerFile) { Get-Content $headerFile -Raw } else { '' }
 
         $statusCode  = $null
@@ -77,6 +92,7 @@ function Invoke-CurlScan {
             StatusCode  = $statusCode
             HttpVersion = $httpVersion
             RawHeaders  = $rawHeaders
+            CurlError   = $curlError
         }
     }
     finally {
@@ -99,13 +115,25 @@ $results = foreach ($target in $targets) {
         VulnerableCandidate  = $false
         DirectOriginExposure = $false
         Caveat               = $null
+        TlsVerified          = $true
         Error                = $null
     }
 
     $scan = Invoke-CurlScan -Url $target.Url -TimeoutSeconds $TimeoutSeconds -UserAgent $userAgent
 
+    # TLS trust failure (TLS inspection proxy, missing CA, ...): retry once without verification.
+    # Safe here because the scan only reads the Server header / negotiated HTTP version.
+    if (-not $StrictTls -and $scan.ExitCode -in $script:TlsExitCodes) {
+        $firstError = $scan.CurlError
+        $scan = Invoke-CurlScan -Url $target.Url -TimeoutSeconds $TimeoutSeconds -UserAgent $userAgent -Insecure
+        $result.TlsVerified = $false
+        if ($scan.ExitCode -eq 0 -and $scan.StatusCode) {
+            $result.Caveat = "TLS certificate not verified (curl: $firstError). Server/HTTP2 data may come from a TLS-inspection proxy, not the origin."
+        }
+    }
+
     if ($scan.ExitCode -ne 0 -or -not $scan.StatusCode) {
-        $result.Error = "curl exit code $($scan.ExitCode) - no response (timeout, DNS failure, or connection refused)"
+        $result.Error = "curl exit code $($scan.ExitCode): $($scan.CurlError)"
         [pscustomobject]$result
         continue
     }
@@ -140,12 +168,14 @@ $results = foreach ($target in $targets) {
     $result.VulnerableCandidate  = ($result.NginxDetected -and $result.Http2Supported)
     $result.DirectOriginExposure = ($result.VulnerableCandidate -and -not $result.FrontedByCdnWaf)
 
+    $tlsNote = $result.Caveat
     if ($result.VulnerableCandidate) {
         if ($result.FrontedByCdnWaf) {
             $result.Caveat = "Behind $($result.CdnWafGuess) - h2 negotiated at edge, origin not confirmed. WAF mitigates, does not fix - patch origin anyway."
         } else {
             $result.Caveat = "No CDN/WAF detected - direct-to-origin exposure, high priority."
         }
+        if ($tlsNote) { $result.Caveat = "$($result.Caveat) $tlsNote" }
     }
 
     [pscustomobject]$result
@@ -161,6 +191,7 @@ Write-Host "`n=== Summary ===" -ForegroundColor Yellow
 Write-Host "Total URLs scanned   : $($results.Count)"
 Write-Host "Fronted by CDN/WAF   : $(($results | Where-Object { $_.FrontedByCdnWaf }).Count)"
 Write-Host "Errors / unreachable : $(($results | Where-Object { $_.Error }).Count)"
+Write-Host "TLS not verified     : $(($results | Where-Object { -not $_.TlsVerified }).Count) (scanned anyway; see Caveat/Error columns)"
 
 if ($nginxOnly.Count -gt 0) {
     Write-Host "`n[NOTICE] nginx detected on $($nginxOnly.Count) host(s):" -ForegroundColor Yellow
