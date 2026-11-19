@@ -30,6 +30,43 @@ if (-not $curlPath) {
     return
 }
 
+# ---- Does this curl.exe support HTTP/2? (many Windows builds lack nghttp2 -> "--http2" is a fatal error) ----
+$curlHasHttp2 = [bool]((& curl.exe -V 2>$null) -match '(?i)\bHTTP2\b')
+
+# ---- ALPN probe: negotiates TLS offering h2 + http/1.1 and reports what the server picks ----
+# Needs .NET 5+ (PowerShell 7). Returns $true / $false, or $null when it cannot be tested.
+$alpnAvailable = [bool]('System.Net.Security.SslClientAuthenticationOptions' -as [type]) -and
+                 [bool]('System.Net.Security.SslApplicationProtocol' -as [type])
+
+function Test-H2Alpn {
+    param([string]$HostName, [int]$Port = 443, [int]$TimeoutSeconds = 10)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))) { return $null }
+        $client.EndConnect($iar)
+        $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false)
+        $opts = New-Object System.Net.Security.SslClientAuthenticationOptions
+        $opts.TargetHost = $HostName
+        $opts.ApplicationProtocols = New-Object 'System.Collections.Generic.List[System.Net.Security.SslApplicationProtocol]'
+        $opts.ApplicationProtocols.Add([System.Net.Security.SslApplicationProtocol]::Http2)
+        $opts.ApplicationProtocols.Add([System.Net.Security.SslApplicationProtocol]::Http11)
+        $opts.RemoteCertificateValidationCallback = [System.Net.Security.RemoteCertificateValidationCallback]{ $true }
+        $ssl.AuthenticateAsClient($opts)
+        return ($ssl.NegotiatedApplicationProtocol -eq [System.Net.Security.SslApplicationProtocol]::Http2)
+    }
+    catch { return $null }
+    finally { $client.Close() }
+}
+
+if (-not $curlHasHttp2) {
+    if ($alpnAvailable) {
+        Write-Warning "This curl.exe has no HTTP/2 support - HTTP/2 will be tested with a TLS ALPN probe instead."
+    } else {
+        Write-Warning "This curl.exe has no HTTP/2 support and this PowerShell (5.1) has no ALPN API: Http2Supported will be 'Unknown'. Use PowerShell 7 (pwsh) or a curl.exe with HTTP2 (https://curl.se/windows/) for HTTP/2 results."
+    }
+}
+
 $userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # ---- Build target list ----
@@ -60,40 +97,43 @@ function Invoke-CurlScan {
 
     $headerFile = [System.IO.Path]::GetTempFileName()
     try {
-        $wFormat = "{0}|{1}" -f '%{http_code}', '%{http_version}'
+        $wFormat = "{0}|{1}|{2}" -f '%{http_code}', '%{http_version}', '%{url_effective}'
         $curlArgs = @(
             '-s', '-S', '-L', '--max-redirs', '5',
             '-o', 'NUL',
             '-D', $headerFile,
-            '--http2',
             # schannel: do not fail when CRL/OCSP servers are unreachable (proxy/firewall)
             '--ssl-no-revoke',
             '-A', $UserAgent,
             '--max-time', $TimeoutSeconds,
             '-w', $wFormat
         )
+        if ($script:curlHasHttp2) { $curlArgs += '--http2' }
         if ($Insecure) { $curlArgs += '-k' }
         $curlArgs += $Url
 
         # -S keeps -s quiet but still prints the error text; capture it instead of discarding it
         $out = & curl.exe @curlArgs 2>&1
         $exitCode = $LASTEXITCODE
-        $stdout = ($out | Where-Object { $_ -is [string] -and $_ -match '^\d{3}\|[\d\.]+$' } | Select-Object -Last 1)
+        $stdout = ($out | Where-Object { $_ -is [string] -and $_ -match '^\d{3}\|[\d\.]+\|' } | Select-Object -Last 1)
         $curlError = (($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } |
                         ForEach-Object { $_.ToString().Trim() }) -join ' ')
         $rawHeaders = if (Test-Path $headerFile) { Get-Content $headerFile -Raw } else { '' }
 
-        $statusCode  = $null
-        $httpVersion = $null
-        if ($stdout -match '^(?<code>\d{3})\|(?<ver>[\d\.]+)$') {
-            $statusCode  = $Matches['code']
-            $httpVersion = $Matches['ver']
+        $statusCode   = $null
+        $httpVersion  = $null
+        $effectiveUrl = $Url
+        if ($stdout -match '^(?<code>\d{3})\|(?<ver>[\d\.]+)\|(?<url>.*)$') {
+            $statusCode   = $Matches['code']
+            $httpVersion  = $Matches['ver']
+            $effectiveUrl = $Matches['url']
         }
 
         return [pscustomobject]@{
             ExitCode    = $exitCode
             StatusCode  = $statusCode
             HttpVersion = $httpVersion
+            EffectiveUrl = $effectiveUrl
             RawHeaders  = $rawHeaders
             CurlError   = $curlError
         }
@@ -171,11 +211,24 @@ $results = foreach ($target in $targets) {
         if ($Matches['ver']) { $result.NginxVersion = $Matches['ver'] }
     }
 
-    $result.Http2Supported = ($scan.HttpVersion -eq '2')
+    if ($curlHasHttp2) {
+        $result.Http2Supported = ($scan.HttpVersion -eq '2')
+    }
+    else {
+        $result.Http2Supported = 'Unknown'
+        if ($alpnAvailable -and $scan.EffectiveUrl -match '^https://(?<h>[^/:]+)(?::(?<p>\d+))?') {
+            $port = if ($Matches['p']) { [int]$Matches['p'] } else { 443 }
+            $alpn = Test-H2Alpn -HostName $Matches['h'] -Port $port -TimeoutSeconds $TimeoutSeconds
+            if ($null -ne $alpn) { $result.Http2Supported = $alpn }
+        }
+    }
 
-    $result.VulnerableCandidate  = ($result.NginxDetected -and $result.Http2Supported)
+    $result.VulnerableCandidate  = ($result.NginxDetected -and ($result.Http2Supported -eq $true))
     $result.DirectOriginExposure = ($result.VulnerableCandidate -and -not $result.FrontedByCdnWaf)
 
+    if ($result.NginxDetected -and $result.Http2Supported -eq 'Unknown') {
+        $result.Caveat = (@($result.Caveat, "nginx detected but HTTP/2 could not be tested - check manually.") | Where-Object { $_ }) -join ' '
+    }
     $tlsNote = $result.Caveat
     if ($result.VulnerableCandidate) {
         if ($result.FrontedByCdnWaf) {
@@ -192,8 +245,9 @@ $results = foreach ($target in $targets) {
 # ---- Output ----
 $results | Sort-Object Region, Url | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
 
-$nginxOnly      = $results | Where-Object { $_.NginxDetected -and -not $_.Http2Supported }
-$nginxPlusHttp2 = $results | Where-Object { $_.NginxDetected -and $_.Http2Supported }
+$nginxOnly      = $results | Where-Object { $_.NginxDetected -and $_.Http2Supported -eq $false }
+$nginxPlusHttp2 = $results | Where-Object { $_.NginxDetected -and $_.Http2Supported -eq $true }
+$nginxUnknown   = $results | Where-Object { $_.NginxDetected -and $_.Http2Supported -eq 'Unknown' }
 
 Write-Host "`n=== Summary ===" -ForegroundColor Yellow
 Write-Host "Total URLs scanned   : $($results.Count)"
@@ -204,6 +258,11 @@ Write-Host "TLS not verified     : $(($results | Where-Object { -not $_.TlsVerif
 if ($nginxOnly.Count -gt 0) {
     Write-Host "`n[NOTICE] nginx detected on $($nginxOnly.Count) host(s):" -ForegroundColor Yellow
     $nginxOnly | Format-Table Region, Url, ServerHeader, NginxVersion, FrontedByCdnWaf -AutoSize
+}
+
+if ($nginxUnknown.Count -gt 0) {
+    Write-Host "`n[NOTICE] nginx detected on $($nginxUnknown.Count) host(s) but HTTP/2 could NOT be tested (see warning at start):" -ForegroundColor Yellow
+    $nginxUnknown | Format-Table Region, Url, ServerHeader, NginxVersion, FrontedByCdnWaf -AutoSize
 }
 
 if ($nginxPlusHttp2.Count -gt 0) {
