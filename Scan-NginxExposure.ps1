@@ -263,6 +263,12 @@ if ($nginxOnly.Count -gt 0) {
 if ($nginxUnknown.Count -gt 0) {
     Write-Host "`n[NOTICE] nginx detected on $($nginxUnknown.Count) host(s) but HTTP/2 could NOT be tested (see warning at start):" -ForegroundColor Yellow
     $nginxUnknown | Format-Table Region, Url, ServerHeader, NginxVersion, FrontedByCdnWaf -AutoSize
+
+    # Hand-off list: run the bash scanner on a machine whose curl has HTTP/2 (Linux, WSL, macOS):
+    #   ./scan-nginx-exposure.sh -o h2.csv nginx=<this file>
+    $listPath = [System.IO.Path]::ChangeExtension($OutputCsv, $null).TrimEnd('.') + '_nginx_hosts_to_test_h2.txt'
+    $nginxUnknown | Select-Object -ExpandProperty Url -Unique | Set-Content -Path $listPath -Encoding ASCII
+    Write-Host "List of these $($nginxUnknown.Count) nginx URLs for an HTTP/2 test elsewhere: $listPath" -ForegroundColor Yellow
 }
 
 if ($nginxPlusHttp2.Count -gt 0) {
